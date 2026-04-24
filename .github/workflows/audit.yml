@@ -2,8 +2,8 @@ name: Sheet Audit
 
 on:
   schedule:
-    # Daily at 06:00 UTC (07:00 WAT).
-    - cron: "0 6 * * *"
+    # Every 30 minutes.
+    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 concurrency:
