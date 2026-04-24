@@ -5,7 +5,11 @@ the audit job is skipped, so the live sheet is only ever mutated by a
 parser whose accuracy was just re-verified on this run.
 """
 
+import pytest
+
 from audit_sheet import (
+    MONTHS_LONG,
+    MONTHS_SHORT,
     analyze_date,
     infer_month,
     parse_amount,
@@ -278,8 +282,96 @@ def test_infer_month_month_boundary_with_later_data_flags_if_sides_disagree():
 
 def test_serial_to_month_known_dates():
     # 1899-12-30 is day 0; 2026-04-15 is a valid April day.
-    from datetime import datetime, timedelta
+    from datetime import datetime
     apr_15_2026 = (datetime(2026, 4, 15) - datetime(1899, 12, 30)).days
     assert serial_to_month(apr_15_2026) == 4
     mar_1_2026 = (datetime(2026, 3, 1) - datetime(1899, 12, 30)).days
     assert serial_to_month(mar_1_2026) == 3
+
+
+# -- Exhaustive per-month coverage --------------------------------------
+#
+# These parametrized tests exercise every month of the year against the
+# parser and the inference rule, so no month can silently regress.
+
+
+@pytest.mark.parametrize("short", MONTHS_SHORT)
+def test_every_short_month_name_parses_canonically(short):
+    assert parse_date(f"15-{short}-2026") == f"15-{short}-2026"
+
+
+@pytest.mark.parametrize("short,long_name", list(zip(MONTHS_SHORT, MONTHS_LONG)))
+def test_every_long_month_name_normalises_to_short(short, long_name):
+    assert parse_date(f"15-{long_name}-2026") == f"15-{short}-2026"
+
+
+@pytest.mark.parametrize("short", MONTHS_SHORT)
+def test_every_month_mixed_case(short):
+    assert parse_date(f"15-{short.upper()}-2026") == f"15-{short}-2026"
+    assert parse_date(f"15-{short.lower()}-2026") == f"15-{short}-2026"
+
+
+# Unique 2-letter prefixes: the 8 months without a same-letter sibling.
+UNIQUE_TWO_LETTER = [
+    ("Ja", "Jan"), ("Fe", "Feb"), ("Ap", "Apr"), ("Au", "Aug"),
+    ("Se", "Sep"), ("Oc", "Oct"), ("No", "Nov"), ("De", "Dec"),
+]
+
+
+@pytest.mark.parametrize("prefix,expected", UNIQUE_TWO_LETTER)
+def test_every_unique_two_letter_prefix_resolves(prefix, expected):
+    # These 8 prefixes match exactly one month, so they auto-correct.
+    assert parse_date(f"15-{prefix}-2026") == f"15-{expected}-2026"
+
+
+@pytest.mark.parametrize("prefix,expected_candidates", [
+    ("Ma", {"Mar", "May"}),
+    ("Ju", {"Jun", "Jul"}),
+    ("J",  {"Jan", "Jun", "Jul"}),
+    ("M",  {"Mar", "May"}),
+    ("A",  {"Apr", "Aug"}),
+])
+def test_ambiguous_prefixes_return_all_candidates(prefix, expected_candidates):
+    canonical, cands, day, year = analyze_date(f"15-{prefix}-2026")
+    assert canonical is None
+    assert set(cands) == expected_candidates
+    assert (day, year) == (15, 2026)
+
+
+@pytest.mark.parametrize("day_in_31,expected", [
+    (31, "Jul"),  # only Jul has 31 days among {Jun, Jul}
+])
+def test_day_31_resolves_ju_to_jul(day_in_31, expected):
+    assert parse_date(f"{day_in_31}-Ju-2026") == f"{day_in_31}-{expected}-2026"
+
+
+@pytest.mark.parametrize("short", MONTHS_SHORT)
+def test_every_month_inferred_from_symmetric_neighbours(short):
+    """For each month, confirm neighbour inference fires when that month's
+    candidate group has symmetric same-month support on both sides."""
+    month_num = MONTHS_SHORT.index(short) + 1
+    # Build plausible candidate groups that include this month as ambiguous.
+    # We fabricate a 2-element candidate list by pairing with a different
+    # month to exercise the inference path.
+    other_num = 1 if month_num != 1 else 2
+    other = MONTHS_SHORT[other_num - 1]
+    candidates = [short, other]
+    # Symmetric strong support for `short`: should pick it.
+    assert infer_month(candidates, [month_num, month_num],
+                       [month_num, month_num]) == short
+    # Symmetric support for the other candidate: should pick the other.
+    assert infer_month(candidates, [other_num, other_num],
+                       [other_num, other_num]) == other
+
+
+@pytest.mark.parametrize("short", MONTHS_SHORT)
+def test_every_month_rejects_one_sided_support(short):
+    """For each month, confirm the boundary-trap rule rejects one-sided support."""
+    month_num = MONTHS_SHORT.index(short) + 1
+    other_num = 1 if month_num != 1 else 2
+    other = MONTHS_SHORT[other_num - 1]
+    candidates = [short, other]
+    # All support on the 'before' side only (e.g. last row of old month).
+    assert infer_month(candidates, [month_num]*5, []) is None
+    # All support on the 'after' side only (e.g. first row of new month).
+    assert infer_month(candidates, [], [month_num]*5) is None
