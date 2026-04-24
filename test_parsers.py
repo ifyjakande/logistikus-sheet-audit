@@ -5,7 +5,13 @@ the audit job is skipped, so the live sheet is only ever mutated by a
 parser whose accuracy was just re-verified on this run.
 """
 
-from audit_sheet import parse_amount, parse_date
+from audit_sheet import (
+    analyze_date,
+    infer_month,
+    parse_amount,
+    parse_date,
+    serial_to_month,
+)
 
 
 def test_date_typo_ap_becomes_apr():
@@ -157,3 +163,98 @@ def test_amount_leading_currency_with_trailing_garbage_rejected():
 def test_amount_non_string_rejected():
     assert parse_amount(1234) is None  # type: ignore[arg-type]
     assert parse_amount(None) is None  # type: ignore[arg-type]
+
+
+# -- analyze_date --------------------------------------------------------
+
+
+def test_analyze_date_returns_candidates_for_ambiguous_ma():
+    canonical, cands, day, year = analyze_date("15-Ma-2026")
+    assert canonical is None
+    assert set(cands) == {"Mar", "May"}
+    assert (day, year) == (15, 2026)
+
+
+def test_analyze_date_returns_candidates_for_ambiguous_ju():
+    canonical, cands, day, year = analyze_date("15-Ju-2026")
+    assert canonical is None
+    assert set(cands) == {"Jun", "Jul"}
+    assert (day, year) == (15, 2026)
+
+
+def test_analyze_date_day_31_disambiguates_ju_to_jul():
+    # Only Jul has 31 days among {Jun, Jul}, so no ambiguity remains.
+    canonical, cands, day, year = analyze_date("31-Ju-2026")
+    assert canonical == "31-Jul-2026"
+    assert cands == []
+    assert (day, year) == (31, 2026)
+
+
+def test_analyze_date_unambiguous_returns_canonical_with_no_candidates():
+    canonical, cands, day, year = analyze_date("15-Ap-2026")
+    assert canonical == "15-Apr-2026"
+    assert cands == []
+    assert (day, year) == (15, 2026)
+
+
+def test_analyze_date_unparseable_returns_empty():
+    canonical, cands, day, year = analyze_date("pending")
+    assert (canonical, cands, day, year) == (None, [], None, None)
+
+
+def test_analyze_date_invalid_day_returns_empty():
+    # Day 32 is invalid for every month; no candidates survive.
+    canonical, cands, day, year = analyze_date("32-Ma-2026")
+    assert (canonical, cands, day, year) == (None, [], None, None)
+
+
+# -- infer_month --------------------------------------------------------
+
+
+def test_infer_month_strong_mar_support():
+    # All 5 neighbours are March (month 3). Candidates are Mar or May.
+    assert infer_month(["Mar", "May"], [3, 3, 3, 3, 3]) == "Mar"
+
+
+def test_infer_month_strong_may_support():
+    assert infer_month(["Mar", "May"], [5, 5, 5]) == "May"
+
+
+def test_infer_month_insufficient_support_flags():
+    # Only 2 neighbours in Mar — below the default threshold of 3.
+    assert infer_month(["Mar", "May"], [3, 3]) is None
+
+
+def test_infer_month_mixed_support_flags():
+    # Neighbours span both candidates — refuse to pick.
+    assert infer_month(["Mar", "May"], [3, 3, 5]) is None
+
+
+def test_infer_month_non_candidate_neighbours_ignored():
+    # April (month 4) isn't a candidate here, so it's irrelevant noise.
+    assert infer_month(["Mar", "May"], [3, 3, 3, 4, 4, 4]) == "Mar"
+
+
+def test_infer_month_no_candidate_neighbours_flags():
+    # All neighbours are in April; neither candidate has any support.
+    assert infer_month(["Mar", "May"], [4, 4, 4, 4]) is None
+
+
+def test_infer_month_empty_candidates_returns_none():
+    assert infer_month([], [3, 3, 3]) is None
+
+
+def test_infer_month_empty_neighbours_returns_none():
+    assert infer_month(["Mar", "May"], []) is None
+
+
+# -- serial_to_month ----------------------------------------------------
+
+
+def test_serial_to_month_known_dates():
+    # 1899-12-30 is day 0; 2026-04-15 is a valid April day.
+    from datetime import datetime, timedelta
+    apr_15_2026 = (datetime(2026, 4, 15) - datetime(1899, 12, 30)).days
+    assert serial_to_month(apr_15_2026) == 4
+    mar_1_2026 = (datetime(2026, 3, 1) - datetime(1899, 12, 30)).days
+    assert serial_to_month(mar_1_2026) == 3

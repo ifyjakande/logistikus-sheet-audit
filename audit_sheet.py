@@ -10,15 +10,23 @@ What it does:
          whitespace, capitalisation variants.
        - Amount cells: currency symbols, commas, surrounding whitespace,
          whitespace-only cells cleared.
-  3) Anything genuinely ambiguous is flagged (never guessed) and the
+  3) For ambiguous month typos (e.g. '15-Ma-2026' -> Mar or May) a second
+     pass inspects neighbouring rows in the same column. If every supporting
+     neighbour agrees on exactly one of the candidate months (with a
+     minimum support threshold) the cell is auto-corrected; otherwise it is
+     flagged for manual review.
+  4) Anything that remains ambiguous is flagged (never guessed) and the
      workflow fails so the owner is notified.
 
 Accuracy rules (strictly enforced):
   - Date input must contain a full day + month + year signal. '2026' or
     'Apr 2026' alone are rejected — we do not fabricate missing components.
-  - A month token that matches more than one calendar month (e.g. 'Ma',
-    'Ju') is rejected as ambiguous.
   - Year must fall in [1900, 2100]; day/month must form a real calendar date.
+  - For ambiguous month prefixes, candidate months are narrowed by day
+    validity first (e.g. '31-Ju-2026' resolves to Jul — Jun has 30 days).
+  - Neighbour inference only fires when exactly one candidate has at least
+    NEIGHBOUR_MIN_SUPPORT neighbours agreeing AND no other candidate has
+    any neighbour support.
   - Amount input must parse as a plain decimal after stripping currency /
     commas / whitespace. Scientific notation and alphabetic residue are
     rejected.
@@ -36,7 +44,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Union
 
 from dateutil import parser as dtparser
@@ -63,6 +71,13 @@ AMOUNT_COLS = [
     ("Expenses",      "E", 5, 1004),
 ]
 
+# Neighbour-inference tuning.
+NEIGHBOUR_WINDOW = 10       # rows to look at on either side
+NEIGHBOUR_MIN_SUPPORT = 3   # minimum agreeing neighbours to commit a fix
+
+# Sheets stores dates as days since 1899-12-30 (Excel-compatible epoch).
+SHEETS_EPOCH = datetime(1899, 12, 30)
+
 
 def normalize_month(token: str) -> Optional[str]:
     """Canonical 3-letter month, or None if the token is ambiguous."""
@@ -75,8 +90,6 @@ def normalize_month(token: str) -> Optional[str]:
     for long_name, short in zip(MONTHS_LONG, MONTHS_SHORT):
         if t == long_name.lower():
             return short
-    # Unique-prefix match only. Rejects ambiguous ('Ma' -> Mar/May) and
-    # non-prefix typos ('Arp' -> ???) so we never guess.
     short_prefix = [s for s in MONTHS_SHORT if s.lower().startswith(t)]
     if len(short_prefix) == 1:
         return short_prefix[0]
@@ -87,52 +100,121 @@ def normalize_month(token: str) -> Optional[str]:
     return None
 
 
+def _candidate_months(token: str) -> list[str]:
+    """All short-month names that could match the token by exact or prefix."""
+    t = token.strip().lower()
+    if not t:
+        return []
+    for s in MONTHS_SHORT:
+        if t == s.lower():
+            return [s]
+    for long_name, short in zip(MONTHS_LONG, MONTHS_SHORT):
+        if t == long_name.lower():
+            return [short]
+    short_prefix = [s for s in MONTHS_SHORT if s.lower().startswith(t)]
+    if short_prefix:
+        return short_prefix
+    long_prefix = [short for long_name, short in zip(MONTHS_LONG, MONTHS_SHORT)
+                   if long_name.lower().startswith(t)]
+    return long_prefix
+
+
 _ORDINAL = re.compile(r"(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
 _STRUCTURED = re.compile(r"^(\d{1,2})[-\s/.]+([A-Za-z]+)[-\s/.]+(\d{2,4})$")
 
 
-def parse_date(text: str) -> Optional[str]:
-    """Return canonical 'D-MMM-YYYY', or None if ambiguous / not a full date."""
+def analyze_date(text: str) -> tuple[Optional[str], list[str], Optional[int], Optional[int]]:
+    """Rich date analysis.
+
+    Returns (canonical, candidates, day, year):
+      - canonical: 'D-MMM-YYYY' if fully resolved, else None.
+      - candidates: list of short month names that are still possible when the
+        input is only ambiguous on the month token. Empty when canonical is
+        set or when the input is unparseable.
+      - day, year: set whenever day and year were extracted successfully,
+        even for ambiguous cases (so neighbour inference can reuse them).
+    """
     if not isinstance(text, str):
-        return None
+        return None, [], None, None
     t = text.strip()
     if not t:
-        return None
+        return None, [], None, None
     t = _ORDINAL.sub(r"\1", t)
 
-    # Strategy A: D sep WordMonth sep Y (day first, month as word)
+    # Strategy A: D sep WordMonth sep Y.
     m = _STRUCTURED.match(t)
     if m:
         day_s, mon_s, yr_s = m.groups()
-        mon = normalize_month(mon_s)
-        if mon is None:
-            return None  # unknown / ambiguous month word — do not guess
         day, year = int(day_s), int(yr_s)
         if year < 100:
             year += 2000
         if not (1900 <= year <= 2100):
-            return None
-        try:
-            datetime(year, MONTHS_SHORT.index(mon) + 1, day)
-        except ValueError:
-            return None
-        return f"{day}-{mon}-{year}"
+            return None, [], None, None
+
+        cands = _candidate_months(mon_s)
+        if not cands:
+            return None, [], None, None
+
+        # Narrow by day validity (e.g. day 31 rules out Jun for 'Ju').
+        valid = []
+        for c in cands:
+            try:
+                datetime(year, MONTHS_SHORT.index(c) + 1, day)
+                valid.append(c)
+            except ValueError:
+                continue
+        if not valid:
+            return None, [], None, None
+        if len(valid) == 1:
+            return f"{day}-{valid[0]}-{year}", [], day, year
+        return None, valid, day, year
 
     # Strategy B: numeric orderings (DD/MM/YYYY, YYYY-MM-DD, etc.)
-    # Guard: require enough components to represent a full date.
     digit_groups = re.findall(r"\d+", t)
     has_month_word = bool(re.search(r"[A-Za-z]{3,}", t))
-    # Need day + month + year => 3 numerics, OR 2 numerics + a month word.
     if not (len(digit_groups) >= 3
             or (len(digit_groups) >= 2 and has_month_word)):
-        return None
+        return None, [], None, None
     try:
         dt = dtparser.parse(t, dayfirst=True, fuzzy=False)
     except (ValueError, OverflowError, TypeError):
-        return None
+        return None, [], None, None
     if not (1900 <= dt.year <= 2100):
+        return None, [], None, None
+    return (f"{dt.day}-{MONTHS_SHORT[dt.month - 1]}-{dt.year}",
+            [], dt.day, dt.year)
+
+
+def parse_date(text: str) -> Optional[str]:
+    """Thin wrapper: return canonical date string only."""
+    canonical, _, _, _ = analyze_date(text)
+    return canonical
+
+
+def infer_month(
+    candidates: list[str],
+    neighbour_months: list[int],
+    min_support: int = NEIGHBOUR_MIN_SUPPORT,
+) -> Optional[str]:
+    """Pick a single candidate month from neighbour context, deterministically.
+
+    Rule: exactly one candidate must have >= min_support neighbours in that
+    month, and no other candidate may have any neighbour support. Neighbours
+    in non-candidate months are ignored (they neither support nor oppose).
+    """
+    if not candidates:
         return None
-    return f"{dt.day}-{MONTHS_SHORT[dt.month - 1]}-{dt.year}"
+    hits = {c: neighbour_months.count(MONTHS_SHORT.index(c) + 1)
+            for c in candidates}
+    supported = [c for c, n in hits.items() if n > 0]
+    if len(supported) == 1 and hits[supported[0]] >= min_support:
+        return supported[0]
+    return None
+
+
+def serial_to_month(serial: Union[int, float]) -> int:
+    """Convert a Sheets date serial to its calendar month (1-12)."""
+    return (SHEETS_EPOCH + timedelta(days=int(serial))).month
 
 
 _AMOUNT_STRIP = re.compile(r"[₦$€£¥,\s]")
@@ -175,12 +257,20 @@ def audit() -> None:
     service, sheet_id = build_service()
 
     date_fixes: list[tuple[str, str]] = []
+    date_inferred: list[tuple[str, str]] = []  # fixes from neighbour inference
     date_anomalies: list[str] = []
     amount_writes: list[tuple[str, Union[int, float]]] = []
     amount_clears: list[str] = []
     amount_anomalies: list[str] = []
 
+    # Phase 1a: scan date columns. Record both clean dates (as neighbour
+    # context) and ambiguous cells for phase 1b resolution.
+    row_month: dict[tuple[str, str], dict[int, int]] = {}
+    ambiguous_dates: list[dict] = []
+
     for tab, col, start, end in DATE_COLS:
+        key = (tab, col)
+        row_month[key] = {}
         rng = f"{tab}!{col}{start}:{col}{end}"
         rows = service.spreadsheets().values().get(
             spreadsheetId=sheet_id, range=rng,
@@ -191,13 +281,43 @@ def audit() -> None:
             if not row:
                 continue
             v = row[0]
-            if isinstance(v, str) and v.strip():
-                fixed = parse_date(v)
-                if fixed:
-                    date_fixes.append((f"{tab}!{col}{i}", fixed))
-                else:
-                    date_anomalies.append(f"{tab}!{col}{i}")
+            if isinstance(v, (int, float)):
+                row_month[key][i] = serial_to_month(v)
+                continue
+            if not (isinstance(v, str) and v.strip()):
+                continue
+            canonical, candidates, day, year = analyze_date(v)
+            if canonical:
+                date_fixes.append((f"{tab}!{col}{i}", canonical))
+                month_num = MONTHS_SHORT.index(canonical.split("-")[1]) + 1
+                row_month[key][i] = month_num
+            elif candidates and day is not None and year is not None:
+                ambiguous_dates.append({
+                    "ref": f"{tab}!{col}{i}",
+                    "key": key, "row": i,
+                    "day": day, "year": year,
+                    "candidates": candidates,
+                })
+            else:
+                date_anomalies.append(f"{tab}!{col}{i}")
 
+    # Phase 1b: neighbour-based inference for ambiguous cells.
+    for amb in ambiguous_dates:
+        neighbours = [
+            month for r, month in row_month[amb["key"]].items()
+            if r != amb["row"]
+            and abs(r - amb["row"]) <= NEIGHBOUR_WINDOW
+        ]
+        inferred = infer_month(amb["candidates"], neighbours)
+        if inferred is not None:
+            canonical = f"{amb['day']}-{inferred}-{amb['year']}"
+            date_inferred.append((amb["ref"], canonical))
+            month_num = MONTHS_SHORT.index(inferred) + 1
+            row_month[amb["key"]][amb["row"]] = month_num
+        else:
+            date_anomalies.append(amb["ref"])
+
+    # Phase 2: scan amount columns.
     for tab, col, start, end in AMOUNT_COLS:
         rng = f"{tab}!{col}{start}:{col}{end}"
         rows = service.spreadsheets().values().get(
@@ -218,8 +338,10 @@ def audit() -> None:
             else:
                 amount_writes.append((f"{tab}!{col}{i}", parsed))
 
+    # Apply writes.
     data_updates = (
         [{"range": r, "values": [[v]]} for r, v in date_fixes]
+        + [{"range": r, "values": [[v]]} for r, v in date_inferred]
         + [{"range": r, "values": [[v]]} for r, v in amount_writes]
     )
     if data_updates:
@@ -232,6 +354,7 @@ def audit() -> None:
             spreadsheetId=sheet_id, body={"ranges": amount_clears},
         ).execute()
 
+    # Verify dashboard.
     dash = service.spreadsheets().values().get(
         spreadsheetId=sheet_id, range="Dashboard!A1:Z200",
         valueRenderOption="UNFORMATTED_VALUE",
@@ -241,13 +364,15 @@ def audit() -> None:
         if isinstance(cell, str) and cell.startswith("#VALUE!")
     )
 
+    # Reporting — counts only, refs only for anomalies.
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     lines = [
         "## Sheet audit",
         "",
         "| metric | count |",
         "| --- | ---: |",
-        f"| Date cells auto-corrected | {len(date_fixes)} |",
+        f"| Date cells auto-corrected (unambiguous) | {len(date_fixes)} |",
+        f"| Date cells inferred from neighbours | {len(date_inferred)} |",
         f"| Amount cells normalized | {len(amount_writes)} |",
         f"| Whitespace-only cells cleared | {len(amount_clears)} |",
         f"| Date anomalies (manual review) | {len(date_anomalies)} |",
@@ -267,6 +392,7 @@ def audit() -> None:
 
     print(
         f"fixed_dates={len(date_fixes)} "
+        f"inferred_dates={len(date_inferred)} "
         f"normalized_amounts={len(amount_writes)} "
         f"cleared_whitespace={len(amount_clears)} "
         f"date_anomalies={len(date_anomalies)} "
