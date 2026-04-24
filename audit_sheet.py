@@ -81,27 +81,6 @@ NEIGHBOUR_MIN_SUPPORT = 3   # minimum agreeing neighbours to commit a fix
 SHEETS_EPOCH = datetime(1899, 12, 30)
 
 
-def normalize_month(token: str) -> Optional[str]:
-    """Canonical 3-letter month, or None if the token is ambiguous."""
-    t = token.strip().lower()
-    if not t:
-        return None
-    for s in MONTHS_SHORT:
-        if t == s.lower():
-            return s
-    for long_name, short in zip(MONTHS_LONG, MONTHS_SHORT):
-        if t == long_name.lower():
-            return short
-    short_prefix = [s for s in MONTHS_SHORT if s.lower().startswith(t)]
-    if len(short_prefix) == 1:
-        return short_prefix[0]
-    long_prefix = [short for long_name, short in zip(MONTHS_LONG, MONTHS_SHORT)
-                   if long_name.lower().startswith(t)]
-    if len(long_prefix) == 1:
-        return long_prefix[0]
-    return None
-
-
 def _candidate_months(token: str) -> list[str]:
     """All short-month names that could match the token by exact or prefix."""
     t = token.strip().lower()
