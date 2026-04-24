@@ -211,41 +211,66 @@ def test_analyze_date_invalid_day_returns_empty():
 # -- infer_month --------------------------------------------------------
 
 
-def test_infer_month_strong_mar_support():
-    # All 5 neighbours are March (month 3). Candidates are Mar or May.
-    assert infer_month(["Mar", "May"], [3, 3, 3, 3, 3]) == "Mar"
+def test_infer_month_mar_support_on_both_sides():
+    # 3 Mar before + 3 Mar after = clear, infers Mar.
+    assert infer_month(["Mar", "May"], [3, 3, 3], [3, 3, 3]) == "Mar"
 
 
-def test_infer_month_strong_may_support():
-    assert infer_month(["Mar", "May"], [5, 5, 5]) == "May"
+def test_infer_month_may_support_on_both_sides():
+    assert infer_month(["Mar", "May"], [5, 5], [5, 5, 5]) == "May"
 
 
-def test_infer_month_insufficient_support_flags():
-    # Only 2 neighbours in Mar — below the default threshold of 3.
-    assert infer_month(["Mar", "May"], [3, 3]) is None
+def test_infer_month_only_before_support_flags():
+    # The 'first row of a new month typo'd' trap: all support is above,
+    # none below. Must flag, not infer.
+    assert infer_month(["Mar", "May"], [3, 3, 3, 3, 3], []) is None
+
+
+def test_infer_month_only_after_support_flags():
+    # Symmetrical: support only from below also flags.
+    assert infer_month(["Mar", "May"], [], [5, 5, 5, 5, 5]) is None
+
+
+def test_infer_month_insufficient_combined_support_flags():
+    # 1 before + 1 after = 2, below threshold 3 even though both sides exist.
+    assert infer_month(["Mar", "May"], [3], [3]) is None
 
 
 def test_infer_month_mixed_support_flags():
     # Neighbours span both candidates — refuse to pick.
-    assert infer_month(["Mar", "May"], [3, 3, 5]) is None
+    assert infer_month(["Mar", "May"], [3, 3], [5]) is None
 
 
 def test_infer_month_non_candidate_neighbours_ignored():
     # April (month 4) isn't a candidate here, so it's irrelevant noise.
-    assert infer_month(["Mar", "May"], [3, 3, 3, 4, 4, 4]) == "Mar"
+    assert infer_month(["Mar", "May"], [3, 3, 4], [3, 4, 4]) == "Mar"
 
 
 def test_infer_month_no_candidate_neighbours_flags():
     # All neighbours are in April; neither candidate has any support.
-    assert infer_month(["Mar", "May"], [4, 4, 4, 4]) is None
+    assert infer_month(["Mar", "May"], [4, 4], [4, 4]) is None
 
 
 def test_infer_month_empty_candidates_returns_none():
-    assert infer_month([], [3, 3, 3]) is None
+    assert infer_month([], [3, 3, 3], [3, 3, 3]) is None
 
 
-def test_infer_month_empty_neighbours_returns_none():
-    assert infer_month(["Mar", "May"], []) is None
+def test_infer_month_both_sides_empty_returns_none():
+    assert infer_month(["Mar", "May"], [], []) is None
+
+
+def test_infer_month_month_boundary_mar_to_apr_typo_in_mar_side():
+    # Ambiguous cell sits near the end of March data; April rows follow.
+    # Before: 5 March neighbours. After: 5 April neighbours (non-candidate).
+    # Only one side has candidate support -> flag (do not guess).
+    assert infer_month(["Mar", "May"], [3, 3, 3, 3, 3], [4, 4, 4, 4, 4]) is None
+
+
+def test_infer_month_month_boundary_with_later_data_flags_if_sides_disagree():
+    # After a month boundary, user typed the first new-month row as "Ju"
+    # and later filled in more July rows. Before = all Jun, After = all Jul.
+    # Two candidates each have one-sided support -> flag.
+    assert infer_month(["Jun", "Jul"], [6, 6, 6], [7, 7, 7]) is None
 
 
 # -- serial_to_month ----------------------------------------------------

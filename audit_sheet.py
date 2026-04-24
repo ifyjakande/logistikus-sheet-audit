@@ -24,9 +24,11 @@ Accuracy rules (strictly enforced):
   - Year must fall in [1900, 2100]; day/month must form a real calendar date.
   - For ambiguous month prefixes, candidate months are narrowed by day
     validity first (e.g. '31-Ju-2026' resolves to Jul — Jun has 30 days).
-  - Neighbour inference only fires when exactly one candidate has at least
-    NEIGHBOUR_MIN_SUPPORT neighbours agreeing AND no other candidate has
-    any neighbour support.
+  - Neighbour inference only fires when exactly one candidate has support
+    on BOTH sides of the ambiguous cell (>=1 neighbour before AND >=1 after)
+    and combined support reaches NEIGHBOUR_MIN_SUPPORT. This prevents
+    mis-inferring when a typo lands on the first row of a new month (the
+    'before' side would be the old month, the 'after' side empty).
   - Amount input must parse as a plain decimal after stripping currency /
     commas / whitespace. Scientific notation and alphabetic residue are
     rejected.
@@ -193,23 +195,41 @@ def parse_date(text: str) -> Optional[str]:
 
 def infer_month(
     candidates: list[str],
-    neighbour_months: list[int],
+    before_months: list[int],
+    after_months: list[int],
     min_support: int = NEIGHBOUR_MIN_SUPPORT,
 ) -> Optional[str]:
     """Pick a single candidate month from neighbour context, deterministically.
 
-    Rule: exactly one candidate must have >= min_support neighbours in that
-    month, and no other candidate may have any neighbour support. Neighbours
-    in non-candidate months are ignored (they neither support nor oppose).
+    Rules (all must hold):
+      1. Exactly one candidate has any neighbour support at all (the other
+         candidate must have zero matching neighbours).
+      2. That candidate must be supported on BOTH sides of the ambiguous
+         cell (>=1 before AND >=1 after). This prevents the month-boundary
+         trap: if you type the first row of a new month and typo it, the
+         'before' side is the old month and the 'after' side has no data
+         yet, so we defer to manual review instead of inferring wrongly.
+      3. Combined support (before + after) must reach min_support.
+
+    Neighbours whose month is not a candidate are ignored (they neither
+    support nor oppose).
     """
     if not candidates:
         return None
-    hits = {c: neighbour_months.count(MONTHS_SHORT.index(c) + 1)
-            for c in candidates}
-    supported = [c for c, n in hits.items() if n > 0]
-    if len(supported) == 1 and hits[supported[0]] >= min_support:
-        return supported[0]
-    return None
+    before_hits = {c: before_months.count(MONTHS_SHORT.index(c) + 1)
+                   for c in candidates}
+    after_hits = {c: after_months.count(MONTHS_SHORT.index(c) + 1)
+                  for c in candidates}
+    supported = [c for c in candidates
+                 if before_hits[c] + after_hits[c] > 0]
+    if len(supported) != 1:
+        return None
+    c = supported[0]
+    if before_hits[c] < 1 or after_hits[c] < 1:
+        return None
+    if before_hits[c] + after_hits[c] < min_support:
+        return None
+    return c
 
 
 def serial_to_month(serial: Union[int, float]) -> int:
@@ -303,12 +323,11 @@ def audit() -> None:
 
     # Phase 1b: neighbour-based inference for ambiguous cells.
     for amb in ambiguous_dates:
-        neighbours = [
-            month for r, month in row_month[amb["key"]].items()
-            if r != amb["row"]
-            and abs(r - amb["row"]) <= NEIGHBOUR_WINDOW
-        ]
-        inferred = infer_month(amb["candidates"], neighbours)
+        before = [month for r, month in row_month[amb["key"]].items()
+                  if amb["row"] - NEIGHBOUR_WINDOW <= r < amb["row"]]
+        after = [month for r, month in row_month[amb["key"]].items()
+                 if amb["row"] < r <= amb["row"] + NEIGHBOUR_WINDOW]
+        inferred = infer_month(amb["candidates"], before, after)
         if inferred is not None:
             canonical = f"{amb['day']}-{inferred}-{amb['year']}"
             date_inferred.append((amb["ref"], canonical))
