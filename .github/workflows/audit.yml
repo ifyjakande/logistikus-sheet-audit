@@ -1,0 +1,38 @@
+name: Sheet Audit
+
+on:
+  schedule:
+    # Daily at 06:00 UTC (07:00 WAT).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sheet-audit
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run parser unit tests
+        run: pytest -q
+
+      - name: Run sheet audit
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python audit_sheet.py
