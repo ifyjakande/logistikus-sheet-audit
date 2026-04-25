@@ -78,6 +78,56 @@ def test_date_extra_whitespace_trimmed():
     assert parse_date("  15-Apr-2026  ") == "15-Apr-2026"
 
 
+def test_date_missing_separator_between_month_and_year():
+    # '24-Ap2026' — the month-to-year boundary has no separator.
+    assert parse_date("24-Ap2026") == "24-Apr-2026"
+    assert parse_date("15-Apr2026") == "15-Apr-2026"
+    assert parse_date("15-April2026") == "15-Apr-2026"
+
+
+def test_date_missing_separator_between_day_and_month():
+    assert parse_date("24Ap-2026") == "24-Apr-2026"
+    assert parse_date("15Apr-2026") == "15-Apr-2026"
+    assert parse_date("15April-2026") == "15-Apr-2026"
+
+
+def test_date_no_separators_at_all():
+    assert parse_date("24Ap2026") == "24-Apr-2026"
+    assert parse_date("15Apr2026") == "15-Apr-2026"
+    assert parse_date("15April2026") == "15-Apr-2026"
+
+
+def test_date_missing_separator_short_year_expanded():
+    assert parse_date("24Ap26") == "24-Apr-2026"
+    assert parse_date("15Apr26") == "15-Apr-2026"
+
+
+def test_date_missing_separator_invalid_day_rejected():
+    assert parse_date("32Ap2026") is None
+    assert parse_date("31Feb2026") is None
+
+
+def test_date_missing_separator_unknown_month_rejected():
+    # 'Xy' is not a prefix of any month — must not guess.
+    assert parse_date("15Xy2026") is None
+    # 'Arp' is not a valid prefix even when separators are stripped.
+    assert parse_date("15Arp2026") is None
+
+
+def test_date_missing_separator_ambiguous_prefix_still_flagged():
+    # '15Ma2026' is still ambiguous (Mar/May) — no separators must not relax that.
+    canonical, cands, day, year = analyze_date("15Ma2026")
+    assert canonical is None
+    assert set(cands) == {"Mar", "May"}
+    assert (day, year) == (15, 2026)
+
+
+def test_date_missing_separator_pure_digits_rejected():
+    # No alpha block at all — must not be coerced into a date.
+    assert parse_date("242026") is None
+    assert parse_date("15042026") is None
+
+
 def test_date_ambiguous_ma_rejected():
     # 'Ma' could be Mar or May — must not guess.
     assert parse_date("15-Ma-2026") is None

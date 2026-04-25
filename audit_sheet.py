@@ -101,7 +101,10 @@ def _candidate_months(token: str) -> list[str]:
 
 
 _ORDINAL = re.compile(r"(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
-_STRUCTURED = re.compile(r"^(\d{1,2})[-\s/.]+([A-Za-z]+)[-\s/.]+(\d{2,4})$")
+# Separators are optional: the day-to-month and month-to-year boundaries are
+# alpha/digit transitions, so they're unambiguous even with no '-', '/', '.',
+# or space between them (e.g. '24-Ap2026', '24Ap2026', '15Apr-2026').
+_STRUCTURED = re.compile(r"^(\d{1,2})[-\s/.]*([A-Za-z]+)[-\s/.]*(\d{2,4})$")
 
 
 def analyze_date(text: str) -> tuple[Optional[str], list[str], Optional[int], Optional[int]]:
